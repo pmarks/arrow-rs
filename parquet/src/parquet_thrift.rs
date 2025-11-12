@@ -302,6 +302,19 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
     /// Read the [`ListIdentifier`] for a Thrift encoded list.
     fn read_list_begin(&mut self) -> ThriftProtocolResult<ListIdentifier> {
         let header = self.read_byte()?;
+
+        // if the element-type and the length are both 0
+        // then this is "empty-list". The element type is
+        // never used, so we accept the invalid value of
+        // 0 for the element-type, and sub in a placeholder.
+        // See #8826
+        if header == 0u8 {
+            return Ok(ListIdentifier {
+                element_type: ElementType::I32,
+                size: 0,
+            });
+        }
+
         let element_type = ElementType::try_from(header & 0x0f)?;
 
         let possible_element_count = (header & 0xF0) >> 4;
