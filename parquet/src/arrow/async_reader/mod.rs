@@ -48,6 +48,7 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
 mod metadata;
+mod prefetch;
 pub use metadata::*;
 
 #[cfg(feature = "object_store")]
@@ -531,7 +532,46 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             schema: projected_schema,
             decoder,
             request_state,
+            prefetch: None,
         })
+    }
+}
+
+impl<T: AsyncFileReader + Clone + Unpin + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
+    /// Build a new [`ParquetRecordBatchStream`] with prefetching enabled.
+    ///
+    /// The pipeline will maintain up to `prefetch_count` concurrent IO requests
+    /// for upcoming row groups, fetching full column chunks for all columns
+    /// needed by both the output projection and any filter predicates.
+    ///
+    /// This can significantly reduce latency when reading Parquet files with
+    /// many small row groups from high-latency storage (e.g., object stores).
+    ///
+    /// Requires `T: Clone` so that the reader can be cloned for each concurrent
+    /// fetch operation.
+    pub fn build_prefetch(self, prefetch_count: usize) -> Result<ParquetRecordBatchStream<T>> {
+        // Extract info needed before build() consumes self
+        let row_groups = self
+            .row_groups
+            .clone()
+            .unwrap_or_else(|| (0..self.metadata.num_row_groups()).collect());
+        let combined =
+            prefetch::compute_combined_projection(&self.projection, self.filter.as_ref());
+        let plans = prefetch::compute_fetch_plans(&self.metadata, &row_groups, &combined);
+        let reader_clone = self.input.0.clone();
+
+        // Build stream normally
+        let mut stream = self.build()?;
+
+        // Attach prefetch pipeline
+        if prefetch_count > 0 {
+            stream.prefetch = Some(prefetch::PrefetchPipeline::new(
+                reader_clone,
+                plans,
+                prefetch_count,
+            ));
+        }
+        Ok(stream)
     }
 }
 
@@ -621,12 +661,15 @@ pub struct ParquetRecordBatchStream<T> {
     request_state: RequestState<T>,
     /// Decoding state machine (no IO)
     decoder: ParquetPushDecoder,
+    /// Optional prefetch pipeline for parallel row group IO
+    prefetch: Option<prefetch::PrefetchPipeline>,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParquetRecordBatchStream")
             .field("request_state", &self.request_state)
+            .field("prefetch", &self.prefetch.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -668,6 +711,16 @@ where
                 RequestState::None { input } => {
                     match self.decoder.try_next_reader()? {
                         DecodeResult::NeedsData(ranges) => {
+                            if let Some(ref mut pipeline) = self.prefetch {
+                                if let Some(result) =
+                                    pipeline.try_satisfy_async(&ranges).await
+                                {
+                                    let data = result?;
+                                    self.decoder.push_ranges(data.ranges, data.data)?;
+                                    self.request_state = RequestState::None { input };
+                                    continue;
+                                }
+                            }
                             self.request_state = RequestState::begin_request(input, ranges);
                             continue; // poll again (as the input might be ready immediately)
                         }
@@ -730,6 +783,26 @@ where
                     // No outstanding requests, proceed to decode the next batch
                     match self.decoder.try_decode()? {
                         DecodeResult::NeedsData(ranges) => {
+                            if let Some(ref mut pipeline) = self.prefetch {
+                                match pipeline.try_satisfy(&ranges, cx) {
+                                    Poll::Ready(Some(Ok(data))) => {
+                                        self.decoder
+                                            .push_ranges(data.ranges, data.data)?;
+                                        self.request_state =
+                                            RequestState::None { input };
+                                        continue;
+                                    }
+                                    Poll::Ready(Some(Err(e))) => return Err(e),
+                                    Poll::Ready(None) => {
+                                        // Pipeline exhausted, fall through to direct fetch
+                                    }
+                                    Poll::Pending => {
+                                        self.request_state =
+                                            RequestState::None { input };
+                                        return Ok(Poll::Pending);
+                                    }
+                                }
+                            }
                             self.request_state = RequestState::begin_request(input, ranges);
                             continue; // poll again (as the input might be ready immediately)
                         }
@@ -1906,5 +1979,243 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Helper to create multi-row-group test data (3 rows per row group)
+    fn make_multi_rg_data() -> Bytes {
+        let a = StringArray::from_iter_values(["a", "b", "b", "b", "c", "c"]);
+        let b = StringArray::from_iter_values(["1", "2", "3", "4", "5", "6"]);
+        let c = Int32Array::from_iter(0..6);
+        let data = RecordBatch::try_from_iter([
+            ("a", Arc::new(a) as ArrayRef),
+            ("b", Arc::new(b) as ArrayRef),
+            ("c", Arc::new(c) as ArrayRef),
+        ])
+        .unwrap();
+
+        let mut buf = Vec::with_capacity(1024);
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut buf, data.schema(), Some(props)).unwrap();
+        writer.write(&data).unwrap();
+        writer.close().unwrap();
+        buf.into()
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_basic() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        // Collect with normal build()
+        let expected: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // Collect with build_prefetch(2)
+        let actual: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build_prefetch(2)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_with_projection() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        let builder = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap();
+        let mask = ProjectionMask::leaves(builder.parquet_schema(), vec![0, 2]);
+
+        let expected: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_projection(mask.clone())
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let actual: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_projection(mask)
+            .with_batch_size(1024)
+            .build_prefetch(2)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_with_filter() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        let builder = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap();
+        let parquet_schema = builder.parquet_schema().clone();
+
+        let make_filter = || {
+            let pred = ArrowPredicateFn::new(
+                ProjectionMask::leaves(&parquet_schema, vec![0]),
+                |batch: RecordBatch| {
+                    let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    let result: BooleanArray = col.iter().map(|v| Some(v.unwrap_or("") == "b")).collect();
+                    Ok(result)
+                },
+            );
+            RowFilter::new(vec![Box::new(pred)])
+        };
+
+        let out_mask = ProjectionMask::leaves(&parquet_schema, vec![2]);
+
+        let expected: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_projection(out_mask.clone())
+            .with_row_filter(make_filter())
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let actual: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_projection(out_mask)
+            .with_row_filter(make_filter())
+            .with_batch_size(1024)
+            .build_prefetch(2)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_with_limit() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        let expected: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .with_limit(4)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let actual: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .with_limit(4)
+            .build_prefetch(2)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_with_next_row_group() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        // Collect via next_row_group with normal build()
+        let mut stream = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build()
+            .unwrap();
+        let mut expected = vec![];
+        while let Some(reader) = stream.next_row_group().await.unwrap() {
+            for batch in reader {
+                expected.push(batch.unwrap());
+            }
+        }
+
+        // Collect via next_row_group with build_prefetch
+        let mut stream = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build_prefetch(2)
+            .unwrap();
+        let mut actual = vec![];
+        while let Some(reader) = stream.next_row_group().await.unwrap() {
+            for batch in reader {
+                actual.push(batch.unwrap());
+            }
+        }
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_count_larger_than_row_groups() {
+        let data = make_multi_rg_data();
+        let test = TestReader::new(data.clone());
+
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
+        assert_eq!(metadata.num_row_groups(), 2);
+
+        // prefetch_count=100 is much larger than 2 row groups — should not panic
+        let expected: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let actual: Vec<_> = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .build_prefetch(100)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(expected, actual);
     }
 }
